@@ -25,9 +25,11 @@ of the predictive distribution, so a calibrated spread is not decoration here --
 it is the score.
 
 The coefficients are fitted at run time from the launch curves the case itself
-ships in `comparables` (38 past releases), leave-one-out validated against the
-contest's own loss. Nothing is baked and nothing is fetched: the program is
-deterministic, offline and stdlib-only.
+ships in `comparables` (38 past releases, 33 of them usable after the two
+exclusions below), and checked by leave-one-out on those curves' own hours 2..24.
+Nothing is baked and nothing is fetched: the program is deterministic, offline
+and stdlib-only. The practice cases' answers are withheld, so no local run can
+measure the contest's loss -- only this leave-one-out proxy on the shipped curves.
 
 Written to run as `python3 /bot/main.py` under the grader's `-P -s` flags.
 """
@@ -40,14 +42,21 @@ from pathlib import Path
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 
 # Residual quantiles are pulled this far toward the pooled distribution, then
-# widened by this factor. Both chosen by leave-one-out on the shipped curves.
+# widened by this factor. Both checked by leave-one-out on the shipped curves:
+# SCALE 1.2 is the grid's optimum and SHRINK 0.3 its, with 0.6 within 0.4% of it
+# (0.452846 against 0.451121 on 15,180 held-out items), so 0.6 is kept.
 SHRINK = 0.6
 SCALE = 1.2
 
 # A curve whose hour-1 print sits this far above its own pre-launch idle level is
 # already hours past its unlock (early access, a staggered PC unlock, a
 # live-service launch), so hour 1 is not the onset the rest of the day continues
-# from. Those are left out of the fit rather than allowed to drag it.
+# from. Those are left out of the fit rather than allowed to drag it. Note the
+# gate bounds the training rows, not the target: a case can sit above it (two of
+# the four practice cases do, at 6.69 and 6.25), and its lift term is then
+# extrapolated. Dropping the gate entirely scores 0.428333 by the same
+# leave-one-out against 0.433775 with it, a 1.3% gain too small to act on when
+# the practice answers are withheld -- so the gate stays, and this is the risk.
 MAX_ABS_LIFT = 6.0
 
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
@@ -192,7 +201,11 @@ def forecast(case):
 
     # Hour 1's print is authoritative when the case carries it; the history is
     # what a case holds before the checkpoint, and it already includes hour 1.
+    # The rules call `known` "one row", so accept either one row or a list of
+    # them: the shipped cases use a one-element list.
     known = case.get("known") or []
+    if isinstance(known, dict):
+        known = [known]
     p1 = next((max(1.0, float(k.get("viewers") or 0)) for k in known
                if k.get("hour") == 1), None)
     if target is None:
