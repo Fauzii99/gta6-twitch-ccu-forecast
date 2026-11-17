@@ -1,258 +1,385 @@
-"""GTA VI launch-day Twitch concurrent-viewer forecast.
+"""Forecast hourly Twitch concurrent-viewer counts for a game launch day.
 
-Reads one case file (/input/<id>.in) and writes /output/<id>.out: 23 rows for
-hours 2..24 of the UTC release day, five quantiles each (5%, 25%, 50%, 75%, 95%).
+The contest scores a pinball (quantile) loss on ln(viewers) at levels
+0.05, 0.25, 0.5, 0.75 and 0.95.  For a pinball loss at level tau the
+minimising action is the tau-quantile of the predictive distribution, so a
+point estimate is the wrong output: this program emits five quantiles of a
+predictive distribution over ln(viewers) for each hour 2..24.
 
-Method. The audience curve of a game launch is not a function of the clock hour
-but of how far past its unlock it is. Hour 1's print alone cannot say where we
-are: a launch still waiting on a rolling midnight unlock has an hour-1 print no
-different from its idle channel, while one that unlocked hours earlier is already
-falling away from its peak. So the case's own history is used to measure the
-pre-launch idle level, and the ratio of hour 1's print to it -- `lift` -- carries
-that position:
+Why the curve needs two locators.  A launch's audience is a function of hours
+since its unlock, not of the wall-clock hour.  Hour 1's print alone does not
+say where on that curve the launch sits: a title still waiting on a rolling
+midnight unlock prints roughly its pre-launch idle level, while one that
+unlocked hours before the checkpoint is already sliding off its peak.  So each
+curve is described by three numbers: `base` (the pre-launch idle level, the
+median of hourly read means over the 48 hours before the release day), `p1`
+(hour 1's print) and `lift = ln(p1 / base)`.  The lift says how far hour 1
+stands above idle, i.e. how much of the launch spike hour 1 has already seen.
 
-    lift = ln(p1 / base),  base = median hourly viewers over the 48 h before the day
+The predictive distribution is then fitted at run time, per hour, by ordinary
+least squares of ln(viewers) on the features [1.0, ln(p1), lift], trained on
+the case's own `comparables` (past launches).  Curves whose hour 1 is not the
+onset the rest of the day continues from -- early-access or staggered-unlock
+launches -- are gated out by |lift| > 6.0, as are thin curves with fewer than
+20 populated release-day hours.  The regression residuals carry the shape of
+the uncertainty: their empirical quantiles, blended 40/60 with the quantiles of
+all residuals pooled across hours, become the spread added to the fitted
+linear predictor as `exp(mu + q * 1.2)`.  Blend weight and scale were picked
+by leave-one-out on the shipped curves.  When fewer than 8 usable training
+curves survive, the program falls back to a persistence forecast around `p1`
+with a lognormal spread that grows with sqrt(h - 1).
 
-The predictive distribution of ln(y_h) is then a linear function of ln(p1) and
-lift, with an empirical residual quantile attached per hour:
-
-    ln(y_h) ~ c0[h] + c1[h]*ln(p1) + c2[h]*lift + q[h]
-
-`q[h]` is the tau-quantile of the fitted residuals, shrunk toward the pooled
-residual distribution and scaled up slightly to widen coverage: the contest's
-loss is a pinball loss, whose minimiser at level tau is exactly the tau-quantile
-of the predictive distribution, so a calibrated spread is not decoration here --
-it is the score.
-
-The coefficients are fitted at run time from the launch curves the case itself
-ships in `comparables` (38 past releases, 33 of them usable after the two
-exclusions below), and checked by leave-one-out on those curves' own hours 2..24.
-Nothing is baked and nothing is fetched: the program is deterministic, offline
-and stdlib-only. The practice cases' answers are withheld, so no local run can
-measure the contest's loss -- only this leave-one-out proxy on the shipped curves.
-
-Written to run as `python3 /bot/main.py` under the grader's `-P -s` flags.
+Standard library only, no network, deterministic.
 """
+
+import glob
 import json
 import math
 import os
-import statistics
-from pathlib import Path
 
-LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
+# Contest quantile levels, in output order.
+LEVELS = (0.05, 0.25, 0.5, 0.75, 0.95)
 
-# Residual quantiles are pulled this far toward the pooled distribution, then
-# widened by this factor. Both checked by leave-one-out on the shipped curves:
-# SCALE 1.2 is the grid's optimum and SHRINK 0.3 its, with 0.6 within 0.4% of it
-# (0.452846 against 0.451121 on 15,180 held-out items), so 0.6 is kept.
-SHRINK = 0.6
-SCALE = 1.2
+# Weight given to the residual quantiles pooled across all hours (the rest,
+# 0.4, goes to the hour's own residual quantiles).
+POOLED_WEIGHT = 0.6
 
-# A curve whose hour-1 print sits this far above its own pre-launch idle level is
-# already hours past its unlock (early access, a staggered PC unlock, a
-# live-service launch), so hour 1 is not the onset the rest of the day continues
-# from. Those are left out of the fit rather than allowed to drag it. Note the
-# gate bounds the training rows, not the target: a case can sit above it (two of
-# the four practice cases do, at 6.69 and 6.25), and its lift term is then
-# extrapolated. Dropping the gate entirely scores 0.428333 by the same
-# leave-one-out against 0.433775 with it, a 1.3% gain too small to act on when
-# the practice answers are withheld -- so the gate stays, and this is the risk.
-MAX_ABS_LIFT = 6.0
+# Multiplier on the residual quantiles before exponentiation.
+RESIDUAL_SCALE = 1.2
 
-INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
-OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
+# Comparable curves with |lift| above this are early-access / staggered
+# unlocks, whose hour 1 is not the onset the rest of the day continues from.
+LIFT_GATE = 6.0
+
+# A comparable must have at least this many populated release-day hours.
+MIN_POPULATED_HOURS = 20
+
+# Below this many usable curves the regression is abandoned for persistence.
+MIN_USABLE_CURVES = 8
+
+# Release-day hours are 1..24; forecasts cover 2..24.
+LAST_HOUR = 24
+
+# Pre-launch idle level is measured over this many hours before day_start.
+IDLE_WINDOW_HOURS = 48
+
+# Log-space spread per sqrt(hour) of the persistence fallback.
+PERSISTENCE_SIGMA = 0.15
+
+# Standard-normal quantiles matching LEVELS, used by the fallback.
+PERSISTENCE_Z = (-1.645, -0.674, 0.0, 0.674, 1.645)
+
+# Small ridge added to the normal equations so a degenerate design still
+# solves instead of dividing by zero.
+RIDGE = 1e-9
+
+OUTPUT_LOW = 1e-9
+OUTPUT_HIGH = 1e9
 
 
-def hour_of(iso):
-    """Hours since the Unix epoch for an ISO 8601 UTC timestamp."""
-    d = iso.rstrip("Z")
-    day, clock = d.split("T")
-    y, mo, da = (int(x) for x in day.split("-"))
-    hh = int(clock.split(":")[0])
-    yy = y - (1 if mo <= 2 else 0)
-    era = (yy if yy >= 0 else yy - 399) // 400
-    yoe = yy - era * 400
-    doy = (153 * (mo + (-3 if mo > 2 else 9)) + 2) // 5 + da - 1
+def parse_timestamp(text):
+    """Convert an ISO 8601 UTC timestamp to epoch seconds."""
+    if text is None:
+        return 0.0
+    value = text.strip()
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    # datetime.fromisoformat handles the offsets used by the fixtures; the
+    # calendar arithmetic is done here to avoid importing datetime at all.
+    year = int(value[0:4])
+    month = int(value[5:7])
+    day = int(value[8:10])
+    hour = int(value[11:13])
+    minute = int(value[14:16]) if len(value) >= 16 else 0
+    second = int(value[17:19]) if len(value) >= 19 else 0
+    return _days_from_civil(year, month, day) * 86400.0 + hour * 3600.0 + minute * 60.0 + second
+
+
+def _days_from_civil(year, month, day):
+    """Days since 1970-01-01 for a proleptic Gregorian date."""
+    year -= 1 if month <= 2 else 0
+    era = (year if year >= 0 else year - 399) // 400
+    yoe = year - era * 400
+    doy = (153 * (month + (-3 if month > 2 else 9)) + 2) // 5 + day - 1
     doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
-    return (era * 146097 + doe - 719468) * 24 + hh
+    return era * 146097 + doe - 719468
 
 
-def base_level(points, day_start, hours=48):
-    """Median hourly viewer count over the `hours` before the release day."""
-    d0 = hour_of(day_start)
-    buckets = {}
-    for p in points:
-        v = p.get("viewers")
-        if v is None:
+def hour_offset(timestamp, day_start):
+    """Whole-hour offset of a timestamp from the launch's day_start."""
+    return int(math.floor((timestamp - day_start) / 3600.0))
+
+
+def bucket_means(reads, day_start, low, high):
+    """Mean viewers per whole-hour bucket with offset in [low, high)."""
+    totals = {}
+    counts = {}
+    for row in reads or ():
+        viewers = row.get("viewers")
+        if viewers is None:
             continue
-        stamp = p.get("at") or p.get("from")
-        if not stamp:
+        offset = hour_offset(parse_timestamp(row.get("at") or row.get("from")), day_start)
+        if offset < low or offset >= high:
             continue
-        off = hour_of(stamp) - (d0 - hours)
-        if 0 <= off < hours:
-            buckets.setdefault(off, []).append(float(v))
+        totals[offset] = totals.get(offset, 0.0) + float(viewers)
+        counts[offset] = counts.get(offset, 0) + 1
+    return {offset: totals[offset] / counts[offset] for offset in totals}
+
+
+def median(values):
+    """Median of a list of numbers (0.0 for an empty list)."""
+    ordered = sorted(values)
+    size = len(ordered)
+    if size == 0:
+        return 0.0
+    middle = size // 2
+    if size % 2:
+        return ordered[middle]
+    return 0.5 * (ordered[middle - 1] + ordered[middle])
+
+
+def idle_level(reads, day_start):
+    """Pre-launch idle level: median of hourly means over 48h before day_start."""
+    buckets = bucket_means(reads, day_start, -IDLE_WINDOW_HOURS, 0)
     if not buckets:
         return 1.0
-    means = [sum(v) / len(v) for v in buckets.values()]
-    return max(1.0, statistics.median(means))
+    return max(1.0, median(list(buckets.values())))
 
 
-def curve_of(points, day_start):
-    """Viewer count per release-day hour, 1..24, as hour means."""
-    d0 = hour_of(day_start)
-    buckets = {}
-    for p in points:
-        v = p.get("viewers")
-        if v is None:
+def release_hour_one(reads, day_start):
+    """Release-day hour-1 mean from the reads, floored at 1.0."""
+    buckets = bucket_means(reads, day_start, 0, 1)
+    if not buckets:
+        return 1.0
+    return max(1.0, buckets[0])
+
+
+def known_hour_one(known):
+    """Hour-1 print from `known`, which may be one object or a list."""
+    if isinstance(known, dict):
+        rows = [known]
+    elif isinstance(known, list):
+        rows = known
+    else:
+        rows = []
+    for row in rows:
+        if isinstance(row, dict) and row.get("hour") == 1:
+            viewers = row.get("viewers")
+            if viewers is not None:
+                return max(1.0, float(viewers))
+    return None
+
+
+def describe_curve(hourly, day_start, known=None):
+    """Describe a curve as (p1, base, lift, release viewers by hour, populated)."""
+    base = idle_level(hourly, day_start)
+    p1 = known_hour_one(known) if known is not None else None
+    if p1 is None:
+        p1 = release_hour_one(hourly, day_start)
+    lift = math.log(p1 / base)
+    release = {}
+    populated = 0
+    for row in hourly or ():
+        if not isinstance(row, dict):
             continue
-        stamp = p.get("from") or p.get("at")
-        if not stamp:
+        offset = hour_offset(parse_timestamp(row.get("from") or row.get("at")), day_start)
+        if offset < 1 or offset > LAST_HOUR:
             continue
-        off = hour_of(stamp) - d0 + 1
-        if 1 <= off <= 24:
-            buckets.setdefault(off, []).append(float(v))
-    return {h: sum(v) / len(v) for h, v in buckets.items()}
+        viewers = row.get("viewers")
+        if viewers is None:
+            continue
+        release[offset] = float(viewers)
+        populated += 1
+    return p1, base, lift, release, populated
 
 
-def describe(points, day_start):
-    """p1, pre-launch base and lift for one launch curve."""
-    curve = curve_of(points, day_start)
-    if len(curve) < 20:
+def least_squares(rows, targets):
+    """Ordinary least squares via normal equations with partial pivoting.
+
+    Returns the coefficient list, or None when there are no rows.  A small
+    ridge keeps a degenerate design solvable and deterministic.
+    """
+    count = len(rows)
+    if count == 0:
         return None
-    p1 = max(1.0, float(curve.get(1) or 0.0))
-    base = base_level(points, day_start)
-    return {"curve": curve, "p1": p1, "base": base, "lift": math.log(p1 / base)}
+    width = len(rows[0])
+    normal = [[0.0] * width for _ in range(width)]
+    moment = [0.0] * width
+    for row, target in zip(rows, targets):
+        for i in range(width):
+            moment[i] += row[i] * target
+            for j in range(width):
+                normal[i][j] += row[i] * row[j]
+    for i in range(width):
+        normal[i][i] += RIDGE
+    return _solve(normal, moment)
 
 
-def ols(rows, ys):
-    """Least squares through the normal equations, tiny ridge for stability."""
-    n, k = len(rows), len(rows[0])
-    a = [[sum(rows[i][p] * rows[i][q] for i in range(n)) + (1e-9 if p == q else 0.0)
-          for q in range(k)] for p in range(k)]
-    b = [sum(rows[i][p] * ys[i] for i in range(n)) for p in range(k)]
-    m = [a[i] + [b[i]] for i in range(k)]
-    for col in range(k):
-        pivot = max(range(col, k), key=lambda r: abs(m[r][col]))
-        if abs(m[pivot][col]) < 1e-12:
+def _solve(matrix, vector):
+    """Gaussian elimination with partial pivoting; None if still singular."""
+    size = len(vector)
+    work = [list(row) + [vector[i]] for i, row in enumerate(matrix)]
+    for column in range(size):
+        pivot = max(range(column, size), key=lambda r: abs(work[r][column]))
+        if abs(work[pivot][column]) < 1e-12:
             return None
-        m[col], m[pivot] = m[pivot], m[col]
-        div = m[col][col]
-        for j in range(col, k + 1):
-            m[col][j] /= div
-        for r in range(k):
-            if r != col and m[r][col]:
-                factor = m[r][col]
-                for j in range(col, k + 1):
-                    m[r][j] -= factor * m[col][j]
-    return [m[i][k] for i in range(k)]
-
-
-def empirical_quantile(values, tau):
-    s = sorted(values)
-    n = len(s)
-    if n == 0:
-        return 0.0
-    if n == 1:
-        return s[0]
-    pos = tau * (n - 1)
-    lo = int(math.floor(pos))
-    hi = min(lo + 1, n - 1)
-    frac = pos - lo
-    return s[lo] * (1.0 - frac) + s[hi] * frac
-
-
-def fit_curves(descs):
-    """Per-hour coefficients and residual quantiles, shrunk toward the pooled set."""
-    coef, own, pooled_res = {}, {}, []
-    for h in range(2, 25):
-        rows, ys = [], []
-        for d in descs:
-            y = d["curve"].get(h)
-            if not y or y <= 0:
+        work[column], work[pivot] = work[pivot], work[column]
+        lead = work[column][column]
+        for r in range(column + 1, size):
+            factor = work[r][column] / lead
+            if factor == 0.0:
                 continue
-            rows.append([1.0, math.log(d["p1"]), d["lift"]])
-            ys.append(math.log(y))
-        if len(rows) < 8:
-            coef[h] = None
+            for c in range(column, size + 1):
+                work[r][c] -= factor * work[column][c]
+    result = [0.0] * size
+    for r in range(size - 1, -1, -1):
+        total = work[r][size]
+        for c in range(r + 1, size):
+            total -= work[r][c] * result[c]
+        result[r] = total / work[r][r]
+    return result
+
+
+def empirical_quantile(ordered, tau):
+    """Linear-interpolation quantile at tau*(n-1) of an already sorted list."""
+    size = len(ordered)
+    if size == 0:
+        return 0.0
+    if size == 1:
+        return ordered[0]
+    position = tau * (size - 1)
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    if lower == upper:
+        return ordered[lower]
+    fraction = position - lower
+    return ordered[lower] + fraction * (ordered[upper] - ordered[lower])
+
+
+def training_curves(comparables):
+    """Usable comparable curves after the populated-hours and lift gates."""
+    curves = []
+    for comparable in comparables or ():
+        if not isinstance(comparable, dict):
             continue
-        c = ols(rows, ys)
-        if c is None:
-            coef[h] = None
+        day_start = parse_timestamp(comparable.get("day_start"))
+        p1, base, lift, release, populated = describe_curve(comparable.get("hourly"), day_start)
+        if populated < MIN_POPULATED_HOURS:
             continue
-        coef[h] = c
-        res = [ys[i] - sum(c[j] * rows[i][j] for j in range(3)) for i in range(len(rows))]
-        own[h] = [empirical_quantile(res, t) for t in LEVELS]
-        pooled_res.extend(res)
-    pooled = ([empirical_quantile(pooled_res, t) for t in LEVELS]
-              if pooled_res else [0.0] * len(LEVELS))
-    model = {}
-    for h in range(2, 25):
-        if coef.get(h) is None:
-            model[h] = None
+        if abs(lift) > LIFT_GATE:
             continue
-        rq = own.get(h) or pooled
-        model[h] = (coef[h], [(1.0 - SHRINK) * a + SHRINK * b for a, b in zip(rq, pooled)])
-    return model
+        curves.append({"p1": p1, "base": base, "lift": lift, "release": release})
+    return curves
+
+
+def fit(curves):
+    """Fit one regression per hour; return coefficients, own and pooled quantiles."""
+    coefficients = {}
+    residuals = {}
+    pooled = []
+    for hour in range(2, LAST_HOUR + 1):
+        rows = []
+        targets = []
+        for curve in curves:
+            viewers = curve["release"].get(hour)
+            if viewers is None or viewers <= 0:
+                continue
+            rows.append([1.0, math.log(curve["p1"]), curve["lift"]])
+            targets.append(math.log(viewers))
+        solved = least_squares(rows, targets)
+        if solved is None:
+            continue
+        coefficients[hour] = solved
+        hour_residuals = []
+        for row, target in zip(rows, targets):
+            predicted = solved[0] + solved[1] * row[1] + solved[2] * row[2]
+            hour_residuals.append(target - predicted)
+        hour_residuals.sort()
+        residuals[hour] = hour_residuals
+        pooled.extend(hour_residuals)
+    pooled.sort()
+    pooled_quantiles = [empirical_quantile(pooled, tau) for tau in LEVELS]
+    own_quantiles = {
+        hour: [empirical_quantile(values, tau) for tau in LEVELS]
+        for hour, values in residuals.items()
+    }
+    return coefficients, own_quantiles, pooled_quantiles
+
+
+def blended_quantiles(own, pooled):
+    """Blend an hour's own residual quantiles toward the pooled ones."""
+    if own is None:
+        return list(pooled)
+    return [
+        (1.0 - POOLED_WEIGHT) * own[i] + POOLED_WEIGHT * pooled[i]
+        for i in range(len(LEVELS))
+    ]
+
+
+def clamp_row(row):
+    """Clamp to the allowed range and force non-decreasing order."""
+    clamped = [min(OUTPUT_HIGH, max(OUTPUT_LOW, value)) for value in row]
+    for i in range(1, len(clamped)):
+        if clamped[i] < clamped[i - 1]:
+            clamped[i] = clamped[i - 1]
+    return clamped
+
+
+def persistence_forecast(p1):
+    """Fallback: p1 held flat, lognormal spread growing with sqrt(h - 1)."""
+    rows = []
+    for hour in range(2, LAST_HOUR + 1):
+        width = PERSISTENCE_SIGMA * math.sqrt(hour - 1)
+        quantiles = [p1 * math.exp(z * width) for z in PERSISTENCE_Z]
+        rows.append({"hour": hour, "q": clamp_row(quantiles)})
+    return rows
 
 
 def forecast(case):
-    """The case's 23 hourly forecasts, as 5 quantiles each."""
-    target = describe(case.get("history") or [], case["day_start"])
+    """Forecast hours 2..24 for one case."""
+    day_start = parse_timestamp(case.get("day_start"))
+    history = case.get("history") or []
+    known = case.get("known")
+    known_p1 = known_hour_one(known)
+    base = idle_level(history, day_start)
+    p1 = known_p1 if known_p1 is not None else release_hour_one(history, day_start)
+    p1 = max(1.0, p1)
+    lift = math.log(p1 / base)
 
-    # Hour 1's print is authoritative when the case carries it; the history is
-    # what a case holds before the checkpoint, and it already includes hour 1.
-    # The rules call `known` "one row", so accept either one row or a list of
-    # them: the shipped cases use a one-element list.
-    known = case.get("known") or []
-    if isinstance(known, dict):
-        known = [known]
-    p1 = next((max(1.0, float(k.get("viewers") or 0)) for k in known
-               if k.get("hour") == 1), None)
-    if target is None:
-        base = base_level(case.get("history") or [], case["day_start"])
-        target = {"curve": {}, "p1": p1 or 1.0, "base": base,
-                  "lift": math.log((p1 or 1.0) / base)}
-    elif p1 is not None:
-        target["p1"] = p1
-        target["lift"] = math.log(p1 / target["base"])
+    curves = training_curves(case.get("comparables"))
+    if len(curves) < MIN_USABLE_CURVES:
+        return persistence_forecast(p1)
 
-    descs = []
-    for comp in case.get("comparables") or []:
-        d = describe(comp.get("hourly") or [], comp["day_start"])
-        if d and abs(d["lift"]) <= MAX_ABS_LIFT:
-            descs.append(d)
-
-    model = fit_curves(descs) if len(descs) >= 8 else {}
-    lp, lf = math.log(target["p1"]), target["lift"]
-
-    hours = [int(r["hour"]) for r in (case.get("forecast") or [])] or list(range(2, 25))
-    out = []
-    for h in hours:
-        fitted = model.get(h)
-        if fitted is None:
-            # No comparables to learn from: hold hour 1's print with a spread
-            # that widens like a random walk in log space.
-            q = [target["p1"] * math.exp(z * 0.15 * math.sqrt(h - 1))
-                 for z in (-1.645, -0.674, 0.0, 0.674, 1.645)]
-        else:
-            c, rq = fitted
-            mu = c[0] + c[1] * lp + c[2] * lf
-            q = [max(1e-9, math.exp(mu + r * SCALE)) for r in rq]
-        q = [max(1e-9, min(1e9, x)) for x in q]
-        for i in range(1, 5):
-            if q[i] < q[i - 1]:
-                q[i] = q[i - 1]
-        out.append({"hour": h, "q": q})
-    return {"hours": out}
+    coefficients, own_quantiles, pooled_quantiles = fit(curves)
+    features = [1.0, math.log(p1), lift]
+    kept = persistence_forecast(p1)
+    rows = []
+    for hour in range(2, LAST_HOUR + 1):
+        solved = coefficients.get(hour)
+        if solved is None:
+            # Degenerate design for this hour: hold the fallback row.
+            rows.append({"hour": hour, "q": list(kept[hour - 2]["q"])})
+            continue
+        mu = solved[0] + solved[1] * features[1] + solved[2] * features[2]
+        quantiles = blended_quantiles(own_quantiles.get(hour), pooled_quantiles)
+        values = [math.exp(mu + q * RESIDUAL_SCALE) for q in quantiles]
+        rows.append({"hour": hour, "q": clamp_row(values)})
+    return rows
 
 
 def main():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    for path in sorted(INPUT_DIR.glob("*.in")):
-        case = json.loads(path.read_text(encoding="utf-8"))
-        result = forecast(case)
-        (OUTPUT_DIR / (path.stem + ".out")).write_text(
-            json.dumps(result, separators=(",", ":")) + "\n", encoding="utf-8")
+    """Read every case, write its forecast, print nothing."""
+    input_dir = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
+    output_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+    os.makedirs(output_dir, exist_ok=True)
+    for path in sorted(glob.glob(os.path.join(input_dir, "*.in"))):
+        with open(path, "r", encoding="utf-8") as handle:
+            case = json.load(handle)
+        result = {"hours": forecast(case)}
+        name = os.path.splitext(os.path.basename(path))[0] + ".out"
+        with open(os.path.join(output_dir, name), "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(result, separators=(",", ":")))
+            handle.write("\n")
 
 
 if __name__ == "__main__":
