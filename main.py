@@ -1,55 +1,54 @@
-"""GTA VI launch-day Twitch CCU forecast: per-hour quantile regression on the
-curve's own shape, coefficients frozen from 24 console single-player launches.
+"""GTA VI launch-day Twitch concurrent-viewer forecast.
 
-Reads one case at /input/<id>.in, writes /output/<id>.out: 23 rows, hours 2..24,
-five quantiles each (5%, 25%, 50%, 75%, 95%), non-decreasing, > 0.
+Reads one case file (/input/<id>.in) and writes /output/<id>.out: 23 rows for
+hours 2..24 of the UTC release day, five quantiles each (5%, 25%, 50%, 75%, 95%).
 
-The predictive distribution of ln(y_h) is a linear function of the case's own
-features plus an empirical residual quantile per hour:
+Method. The audience curve of a game launch is not a function of the clock hour
+but of how far past its unlock it is. Hour 1's print alone cannot say where we
+are: a launch still waiting on a rolling midnight unlock has an hour-1 print no
+different from its idle channel, while one that unlocked hours earlier is already
+falling away from its peak. So the case's own history is used to measure the
+pre-launch idle level, and the ratio of hour 1's print to it -- `lift` -- carries
+that position:
+
+    lift = ln(p1 / base),  base = median hourly viewers over the 48 h before the day
+
+The predictive distribution of ln(y_h) is then a linear function of ln(p1) and
+lift, with an empirical residual quantile attached per hour:
 
     ln(y_h) ~ c0[h] + c1[h]*ln(p1) + c2[h]*lift + q[h]
 
-where p1 is hour 1's print and lift = ln(p1 / base), base being the median hourly
-viewer count over the 48 h before the release day -- the pre-launch idle level.
-lift separates a launch that has already unlocked (high lift, audience falling
-away from its first-hour peak) from one still waiting (low lift, audience ahead).
+`q[h]` is the tau-quantile of the fitted residuals, shrunk toward the pooled
+residual distribution and scaled up slightly to widen coverage: the contest's
+loss is a pinball loss, whose minimiser at level tau is exactly the tau-quantile
+of the predictive distribution, so a calibrated spread is not decoration here --
+it is the score.
 
-Deterministic: no clock, no randomness, no network, stdlib only.
+The coefficients are fitted at run time from the launch curves the case itself
+ships in `comparables` (38 past releases), leave-one-out validated against the
+contest's own loss. Nothing is baked and nothing is fetched: the program is
+deterministic, offline and stdlib-only.
+
+Written to run as `python3 /bot/main.py` under the grader's `-P -s` flags.
 """
 import json
 import math
 import os
-import sys
+import statistics
 from pathlib import Path
 
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 
-# (c0, c1, c2) per hour 2..24, then the five residual quantiles for that hour.
-COEF = {
-    2:  (-0.594237, 1.044700, -0.020537, -0.409267, -0.171479, -0.004276, 0.153695, 0.447287),
-    3:  (-1.362374, 1.099450, -0.047569, -0.589076, -0.211668, 0.017304, 0.236750, 0.532926),
-    4:  (-0.664300, 1.025834, -0.025208, -0.598350, -0.257667, 0.045272, 0.268667, 0.561211),
-    5:  (-0.298912, 0.984645, 0.038367, -0.688806, -0.253067, -0.009743, 0.289353, 0.686705),
-    6:  (0.143248, 0.952272, 0.054637, -0.884818, -0.345217, 0.031629, 0.288905, 0.873218),
-    7:  (1.120981, 0.869610, 0.050984, -0.856421, -0.382382, -0.005995, 0.288556, 1.033899),
-    8:  (2.142067, 0.783691, 0.056807, -0.828571, -0.270135, -0.052235, 0.275893, 1.009723),
-    9:  (2.593287, 0.741792, 0.065281, -0.737742, -0.309051, -0.071388, 0.304263, 1.024565),
-    10: (2.698278, 0.732946, 0.069723, -0.670951, -0.371943, -0.087456, 0.271180, 1.024895),
-    11: (3.095638, 0.701705, 0.069383, -0.721214, -0.336943, -0.058579, 0.271195, 0.995960),
-    12: (3.411736, 0.680906, 0.069693, -0.740294, -0.327214, -0.069599, 0.278910, 0.954478),
-    13: (4.021396, 0.641880, 0.068650, -0.704102, -0.345590, -0.058871, 0.236797, 0.905327),
-    14: (4.337034, 0.625016, 0.071806, -0.779744, -0.373861, -0.060907, 0.267492, 0.880060),
-    15: (5.006127, 0.575785, 0.079759, -0.829211, -0.343383, -0.068452, 0.298983, 0.828933),
-    16: (5.376949, 0.551334, 0.077273, -0.750975, -0.341044, -0.083946, 0.288604, 0.799554),
-    17: (4.929297, 0.598638, 0.071863, -0.796942, -0.306239, -0.089980, 0.317202, 0.736896),
-    18: (5.188201, 0.579764, 0.076097, -0.773916, -0.335895, -0.053650, 0.318722, 0.751014),
-    19: (5.515461, 0.555277, 0.083957, -0.737131, -0.341689, -0.089952, 0.318799, 0.741785),
-    20: (5.763916, 0.534050, 0.090785, -0.710999, -0.365817, -0.087262, 0.324270, 0.757299),
-    21: (5.786013, 0.530292, 0.091091, -0.688371, -0.406286, -0.061927, 0.330785, 0.822890),
-    22: (5.719397, 0.535701, 0.084242, -0.737269, -0.338324, -0.034225, 0.342047, 0.765307),
-    23: (5.164271, 0.581452, 0.077128, -0.777856, -0.285284, -0.089115, 0.351865, 0.764309),
-    24: (4.552063, 0.621098, 0.092024, -0.673820, -0.338565, -0.076996, 0.334269, 0.803228),
-}
+# Residual quantiles are pulled this far toward the pooled distribution, then
+# widened by this factor. Both chosen by leave-one-out on the shipped curves.
+SHRINK = 0.6
+SCALE = 1.2
+
+# A curve whose hour-1 print sits this far above its own pre-launch idle level is
+# already hours past its unlock (early access, a staggered PC unlock, a
+# live-service launch), so hour 1 is not the onset the rest of the day continues
+# from. Those are left out of the fit rather than allowed to drag it.
+MAX_ABS_LIFT = 6.0
 
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
@@ -69,62 +68,178 @@ def hour_of(iso):
     return (era * 146097 + doe - 719468) * 24 + hh
 
 
-def median(vals):
-    s = sorted(vals)
-    n = len(s)
-    if n == 0:
-        return 1.0
-    mid = n // 2
-    return float(s[mid]) if n % 2 else 0.5 * (s[mid - 1] + s[mid])
-
-
-def prelaunch_base(case):
-    """Median hourly viewer count over the 48 h before the release day."""
-    d0 = hour_of(case["day_start"])
+def base_level(points, day_start, hours=48):
+    """Median hourly viewer count over the `hours` before the release day."""
+    d0 = hour_of(day_start)
     buckets = {}
-    for p in case.get("history") or []:
+    for p in points:
         v = p.get("viewers")
         if v is None:
             continue
-        off = hour_of(p["at"] if "at" in p else p["from"]) - (d0 - 48)
-        if 0 <= off < 48:
+        stamp = p.get("at") or p.get("from")
+        if not stamp:
+            continue
+        off = hour_of(stamp) - (d0 - hours)
+        if 0 <= off < hours:
             buckets.setdefault(off, []).append(float(v))
+    if not buckets:
+        return 1.0
     means = [sum(v) / len(v) for v in buckets.values()]
-    return max(1.0, median(means)) if means else 1.0
+    return max(1.0, statistics.median(means))
 
 
-def first_print(case):
-    for k in case.get("known") or []:
-        if k.get("hour") == 1:
-            return max(1.0, float(k.get("viewers") or 0))
-    return 1.0
+def curve_of(points, day_start):
+    """Viewer count per release-day hour, 1..24, as hour means."""
+    d0 = hour_of(day_start)
+    buckets = {}
+    for p in points:
+        v = p.get("viewers")
+        if v is None:
+            continue
+        stamp = p.get("from") or p.get("at")
+        if not stamp:
+            continue
+        off = hour_of(stamp) - d0 + 1
+        if 1 <= off <= 24:
+            buckets.setdefault(off, []).append(float(v))
+    return {h: sum(v) / len(v) for h, v in buckets.items()}
 
 
-def hour_quantiles(p1, lift, h):
-    row = COEF[h]
-    mu = row[0] + row[1] * math.log(p1) + row[2] * lift
-    return [max(1e-9, math.exp(mu + q)) for q in row[3:]]
+def describe(points, day_start):
+    """p1, pre-launch base and lift for one launch curve."""
+    curve = curve_of(points, day_start)
+    if len(curve) < 20:
+        return None
+    p1 = max(1.0, float(curve.get(1) or 0.0))
+    base = base_level(points, day_start)
+    return {"curve": curve, "p1": p1, "base": base, "lift": math.log(p1 / base)}
 
 
-def forecast_case(case):
-    p1 = first_print(case)
-    base = prelaunch_base(case)
-    lift = math.log(p1 / base)
-    rows = []
-    for row in case.get("forecast") or [{"hour": h} for h in range(2, 25)]:
-        h = int(row["hour"])
-        q = hour_quantiles(p1, lift, h)
-        rows.append({"hour": h, "q": q})
-    return {"hours": rows}
+def ols(rows, ys):
+    """Least squares through the normal equations, tiny ridge for stability."""
+    n, k = len(rows), len(rows[0])
+    a = [[sum(rows[i][p] * rows[i][q] for i in range(n)) + (1e-9 if p == q else 0.0)
+          for q in range(k)] for p in range(k)]
+    b = [sum(rows[i][p] * ys[i] for i in range(n)) for p in range(k)]
+    m = [a[i] + [b[i]] for i in range(k)]
+    for col in range(k):
+        pivot = max(range(col, k), key=lambda r: abs(m[r][col]))
+        if abs(m[pivot][col]) < 1e-12:
+            return None
+        m[col], m[pivot] = m[pivot], m[col]
+        div = m[col][col]
+        for j in range(col, k + 1):
+            m[col][j] /= div
+        for r in range(k):
+            if r != col and m[r][col]:
+                factor = m[r][col]
+                for j in range(col, k + 1):
+                    m[r][j] -= factor * m[col][j]
+    return [m[i][k] for i in range(k)]
+
+
+def empirical_quantile(values, tau):
+    s = sorted(values)
+    n = len(s)
+    if n == 0:
+        return 0.0
+    if n == 1:
+        return s[0]
+    pos = tau * (n - 1)
+    lo = int(math.floor(pos))
+    hi = min(lo + 1, n - 1)
+    frac = pos - lo
+    return s[lo] * (1.0 - frac) + s[hi] * frac
+
+
+def fit_curves(descs):
+    """Per-hour coefficients and residual quantiles, shrunk toward the pooled set."""
+    coef, own, pooled_res = {}, {}, []
+    for h in range(2, 25):
+        rows, ys = [], []
+        for d in descs:
+            y = d["curve"].get(h)
+            if not y or y <= 0:
+                continue
+            rows.append([1.0, math.log(d["p1"]), d["lift"]])
+            ys.append(math.log(y))
+        if len(rows) < 8:
+            coef[h] = None
+            continue
+        c = ols(rows, ys)
+        if c is None:
+            coef[h] = None
+            continue
+        coef[h] = c
+        res = [ys[i] - sum(c[j] * rows[i][j] for j in range(3)) for i in range(len(rows))]
+        own[h] = [empirical_quantile(res, t) for t in LEVELS]
+        pooled_res.extend(res)
+    pooled = ([empirical_quantile(pooled_res, t) for t in LEVELS]
+              if pooled_res else [0.0] * len(LEVELS))
+    model = {}
+    for h in range(2, 25):
+        if coef.get(h) is None:
+            model[h] = None
+            continue
+        rq = own.get(h) or pooled
+        model[h] = (coef[h], [(1.0 - SHRINK) * a + SHRINK * b for a, b in zip(rq, pooled)])
+    return model
+
+
+def forecast(case):
+    """The case's 23 hourly forecasts, as 5 quantiles each."""
+    target = describe(case.get("history") or [], case["day_start"])
+
+    # Hour 1's print is authoritative when the case carries it; the history is
+    # what a case holds before the checkpoint, and it already includes hour 1.
+    known = case.get("known") or []
+    p1 = next((max(1.0, float(k.get("viewers") or 0)) for k in known
+               if k.get("hour") == 1), None)
+    if target is None:
+        base = base_level(case.get("history") or [], case["day_start"])
+        target = {"curve": {}, "p1": p1 or 1.0, "base": base,
+                  "lift": math.log((p1 or 1.0) / base)}
+    elif p1 is not None:
+        target["p1"] = p1
+        target["lift"] = math.log(p1 / target["base"])
+
+    descs = []
+    for comp in case.get("comparables") or []:
+        d = describe(comp.get("hourly") or [], comp["day_start"])
+        if d and abs(d["lift"]) <= MAX_ABS_LIFT:
+            descs.append(d)
+
+    model = fit_curves(descs) if len(descs) >= 8 else {}
+    lp, lf = math.log(target["p1"]), target["lift"]
+
+    hours = [int(r["hour"]) for r in (case.get("forecast") or [])] or list(range(2, 25))
+    out = []
+    for h in hours:
+        fitted = model.get(h)
+        if fitted is None:
+            # No comparables to learn from: hold hour 1's print with a spread
+            # that widens like a random walk in log space.
+            q = [target["p1"] * math.exp(z * 0.15 * math.sqrt(h - 1))
+                 for z in (-1.645, -0.674, 0.0, 0.674, 1.645)]
+        else:
+            c, rq = fitted
+            mu = c[0] + c[1] * lp + c[2] * lf
+            q = [max(1e-9, math.exp(mu + r * SCALE)) for r in rq]
+        q = [max(1e-9, min(1e9, x)) for x in q]
+        for i in range(1, 5):
+            if q[i] < q[i - 1]:
+                q[i] = q[i - 1]
+        out.append({"hour": h, "q": q})
+    return {"hours": out}
 
 
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     for path in sorted(INPUT_DIR.glob("*.in")):
         case = json.loads(path.read_text(encoding="utf-8"))
-        out = forecast_case(case)
-        (OUTPUT_DIR / f"{path.stem}.out").write_text(
-            json.dumps(out, separators=(",", ":")) + "\n", encoding="utf-8")
+        result = forecast(case)
+        (OUTPUT_DIR / (path.stem + ".out")).write_text(
+            json.dumps(result, separators=(",", ":")) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":
